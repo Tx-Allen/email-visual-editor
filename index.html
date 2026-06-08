@@ -305,6 +305,7 @@
       [contenteditable=true]{ caret-color:#ec4899; cursor:text !important;
         -webkit-user-select:text !important; user-select:text !important; }
       [contenteditable=true]:focus{ outline:2px dashed #ec4899 !important; }
+      [data-ee-bind]{ box-shadow:inset 0 0 0 1px rgba(34,197,94,.45) !important; }
     `;
     const b = doc.body;
     b.addEventListener('mouseover', onHover, true);
@@ -313,6 +314,7 @@
     b.addEventListener('click', onClick, true);
     b.addEventListener('focusin', onFocusIn, true);
     b.addEventListener('focusout', onFocusOut, true);
+    b.addEventListener('input', onFrameInput, true);
     doc.addEventListener('keydown', onFrameKey, true);
   }
 
@@ -410,6 +412,14 @@
     }
     editingBefore = null;
   }
+  function onFrameInput(e){
+    if(!editMode || syncingBind) return;
+    const el = e.target;
+    if(el && el.isContentEditable && el.getAttribute('data-ee-bind')){
+      syncBoundText(el);
+      if(el===selected){ const text = $('#f-text'); if(text) text.value = el.textContent; }
+    }
+  }
 
   function onFrameKey(e){
     const ae = doc.activeElement;
@@ -448,6 +458,55 @@
   function esc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
   function hasElementChildren(el){ return el.children && el.children.length>0; }
   function normalizeVariableKey(s){ return (s||'').trim().replace(/[{}]/g,'').replace(/\s+/g,'_'); }
+  let syncingBind = false;
+  function isTextBindable(el){ return !!(el && !isMedia(el) && !hasElementChildren(el)); }
+  function textOf(el){ return (el && el.textContent || '').trim(); }
+  function hashText(s){
+    let h = 0; s = String(s||'');
+    for(let i=0;i<s.length;i++) h = ((h<<5)-h+s.charCodeAt(i)) | 0;
+    return Math.abs(h).toString(36);
+  }
+  function defaultBindKey(el){
+    return normalizeVariableKey(el && el.getAttribute('data-ee-bind')) || 'sync_'+hashText(textOf(el)||Date.now()).slice(0,6);
+  }
+  function boundNodes(key){
+    if(!doc || !key) return [];
+    return Array.from(doc.body.querySelectorAll('[data-ee-bind]')).filter(n=>n.getAttribute('data-ee-bind')===key);
+  }
+  function sameTextNodes(el){
+    const txt = textOf(el);
+    if(!doc || !txt) return [];
+    return Array.from(doc.body.querySelectorAll('*')).filter(n=>isTextBindable(n) && textOf(n)===txt);
+  }
+  function syncBoundText(source){
+    if(!source || syncingBind) return 0;
+    const key = source.getAttribute('data-ee-bind');
+    if(!key) return 0;
+    syncingBind = true;
+    let count = 0;
+    boundNodes(key).forEach(n=>{
+      if(n!==source && isTextBindable(n)){ n.textContent = source.textContent; count++; }
+    });
+    syncingBind = false;
+    return count;
+  }
+  function applyTextBinding(el,key,targets){
+    key = normalizeVariableKey(key) || defaultBindKey(el);
+    targets = (targets && targets.length ? targets : [el]).filter(isTextBindable);
+    targets.forEach(n=>n.setAttribute('data-ee-bind',key));
+    syncBoundText(el);
+    snapshot();
+    renderInspector(el);
+    toast('已绑定 '+targets.length+' 处到 '+key);
+  }
+  function clearTextBinding(el){
+    if(!el || !el.getAttribute('data-ee-bind')){ toast('当前元素未绑定'); return; }
+    const key = el.getAttribute('data-ee-bind');
+    el.removeAttribute('data-ee-bind');
+    snapshot();
+    renderInspector(el);
+    toast('已解除当前绑定（同组剩余 '+boundNodes(key).length+' 处）');
+  }
 
   function renderInspector(el){
     const tag = el.tagName.toLowerCase();
@@ -460,12 +519,23 @@
 
     // text content (only safe when no child elements)
     if(!isMedia(el) && !hasElementChildren(el)){
+      const bindKey = el.getAttribute('data-ee-bind') || '';
+      const bindCount = bindKey ? boundNodes(bindKey).length : 0;
       h += `<div class="sec"><h4>文字内容</h4>
         <div class="field"><textarea id="f-text" placeholder="输入文字…">${esc(el.textContent)}</textarea></div>
         <div class="field"><label>批量变量</label><div class="inline-action">
           <input type="text" id="f-var-name" placeholder="name / coupon / link">
           <button class="btn" id="f-var-apply" type="button">设为变量</button>
-        </div></div></div>`;
+        </div></div>
+        <div class="field"><label>同步绑定</label><div class="inline-action">
+          <input type="text" id="f-bind-name" value="${esc(bindKey)}" placeholder="campaign_title">
+          <button class="btn" id="f-bind-apply" type="button">绑定本项</button>
+        </div>
+        <div class="batch-tools" style="margin:8px 0 0">
+          <button class="btn" id="f-bind-same" type="button">绑定同文</button>
+          <button class="btn" id="f-bind-clear" type="button">解除</button>
+        </div>
+        <div class="hint">${bindKey ? `同组 ${bindCount} 处 · ${esc(bindKey)}` : '未绑定'}</div></div></div>`;
     }
 
     // link
@@ -521,7 +591,7 @@
   function bind(el){
     const on = (id,ev,fn)=>{ const n=$('#'+id); if(n) n.addEventListener(ev,fn); };
 
-    on('f-text','input',e=>{ el.textContent = e.target.value; });
+    on('f-text','input',e=>{ el.textContent = e.target.value; syncBoundText(el); });
     on('f-text','change',snapshot);
     on('f-var-apply','click',()=>{
       const key = normalizeVariableKey(($('#f-var-name')||{}).value);
@@ -529,10 +599,22 @@
       const token = '{{'+key+'}}';
       el.textContent = token;
       const text = $('#f-text'); if(text) text.value = token;
+      syncBoundText(el);
       snapshot();
       updateBatchPreview();
       toast('已设为变量 '+token);
     });
+    on('f-bind-apply','click',()=>{
+      if(!isTextBindable(el)){ toast('当前元素不能绑定'); return; }
+      applyTextBinding(el, ($('#f-bind-name')||{}).value, [el]);
+    });
+    on('f-bind-same','click',()=>{
+      if(!isTextBindable(el)){ toast('当前元素不能绑定'); return; }
+      const matches = sameTextNodes(el);
+      if(!matches.length){ toast('没有找到相同文字'); return; }
+      applyTextBinding(el, ($('#f-bind-name')||{}).value, matches);
+    });
+    on('f-bind-clear','click',()=>clearTextBinding(el));
 
     on('f-href','input',e=>el.setAttribute('href',e.target.value));
     on('f-href','change',snapshot);
@@ -590,6 +672,7 @@
     const clone = doc.documentElement.cloneNode(true);
     const s = clone.querySelector('#__ee_style'); if(s) s.remove();
     clone.querySelectorAll('[contenteditable]').forEach(n=>n.removeAttribute('contenteditable'));
+    clone.querySelectorAll('[data-ee-bind]').forEach(n=>n.removeAttribute('data-ee-bind'));
     clone.querySelectorAll('.__ee-hover,.__ee-selected').forEach(n=>{
       n.classList.remove('__ee-hover','__ee-selected'); if(!n.getAttribute('class')) n.removeAttribute('class');
     });
