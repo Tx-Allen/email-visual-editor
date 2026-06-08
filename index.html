@@ -233,6 +233,8 @@
   let doc = null;          // iframe document
   let editMode = true;
   let selected = null;
+  let selectedSet = new Set();
+  let nextElementId = 1;
   let editingBefore = null;
 
   /* ---------- toast ---------- */
@@ -269,6 +271,7 @@
   function restore(html){
     deselect();
     doc.body.innerHTML = html;
+    ensureElementIds();
     updateHistoryButtons();
   }
   function undo(){ if(hpos>0){ hpos--; restore(history[hpos]); toast('已撤销'); } }
@@ -283,7 +286,9 @@
     $('#dropHint').style.display = 'none';
     frame.onload = ()=>{
       doc = frame.contentDocument || frame.contentWindow.document;
+      nextElementId = 1;
       injectLayer();
+      ensureElementIds();
       history = []; hpos = -1; snapshot();
       deselect();
       updateBatchPreview();
@@ -302,10 +307,18 @@
         cursor:pointer !important; border-radius:2px; }
       .__ee-selected{ outline:2px solid #ec4899 !important; outline-offset:1px !important;
         box-shadow:0 0 0 3px rgba(236,72,153,.30), 0 0 18px 3px rgba(236,72,153,.6) !important; }
+      [data-ee-id].__ee-hover,[data-ee-id].__ee-selected{ position:relative !important; }
+      [data-ee-id].__ee-hover::before,[data-ee-id].__ee-selected::before{
+        content:attr(data-ee-id); position:absolute !important; left:0 !important; top:0 !important;
+        transform:translateY(-100%) !important; z-index:2147483647 !important; pointer-events:none !important;
+        background:#111827 !important; color:#c7cdff !important; border:1px solid #6366f1 !important;
+        border-radius:4px !important; padding:1px 5px !important; font:11px/1.4 ui-monospace,Menlo,Consolas,monospace !important;
+      }
       [contenteditable=true]{ caret-color:#ec4899; cursor:text !important;
         -webkit-user-select:text !important; user-select:text !important; }
       [contenteditable=true]:focus{ outline:2px dashed #ec4899 !important; }
       [data-ee-bind]{ box-shadow:inset 0 0 0 1px rgba(34,197,94,.45) !important; }
+      [data-ee-if]{ box-shadow:inset 0 0 0 1px rgba(245,158,11,.45) !important; }
     `;
     const b = doc.body;
     b.addEventListener('mouseover', onHover, true);
@@ -320,6 +333,37 @@
 
   function isArtifact(el){ return !el || el.id==='__ee_style' || el===doc.documentElement; }
   function isMedia(el){ return /^(IMG|HR|BR|INPUT|VIDEO|IFRAME|svg|IMAGE)$/i.test(el.tagName); }
+  function editableNodes(root){
+    if(!doc) return [];
+    root = root || doc.body;
+    const nodes = Array.from(root.querySelectorAll('*'));
+    if(root.nodeType===1) nodes.unshift(root);
+    return nodes.filter(n=>n!==doc.body && !isArtifact(n) && n.tagName !== 'STYLE');
+  }
+  function ensureElementIds(root){
+    if(!doc) return;
+    const used = new Set();
+    editableNodes(root).forEach(n=>{
+      let id = n.getAttribute('data-ee-id');
+      if(!id || used.has(id)){
+        do{ id = 'E'+(nextElementId++); }while(used.has(id));
+        n.setAttribute('data-ee-id', id);
+      }
+      used.add(id);
+      const num = parseInt(String(id).replace(/\D/g,''),10);
+      if(num>=nextElementId) nextElementId = num+1;
+    });
+  }
+  function clearEditorSelection(root){
+    root = root || doc;
+    root.querySelectorAll('[contenteditable]').forEach(n=>n.removeAttribute('contenteditable'));
+    root.querySelectorAll('.__ee-hover,.__ee-selected').forEach(n=>{
+      n.classList.remove('__ee-hover','__ee-selected');
+      if(!n.getAttribute('class')) n.removeAttribute('class');
+    });
+  }
+  function selectedNodes(){ return Array.from(selectedSet).filter(n=>doc && doc.body.contains(n)); }
+  function selectedTextNodes(){ return selectedNodes().filter(isTextBindable); }
 
   /* ---------- hover ---------- */
   function onHover(e){
@@ -350,15 +394,16 @@
     const el = e.target;
     if(isArtifact(el)) return;
     const inLink = el.closest && el.closest('a');
+    const multi = e.ctrlKey || e.metaKey || e.shiftKey;
     // clicking inside the element currently being edited -> let caret move freely
-    if(selected && selected.isContentEditable && (el===selected || selected.contains(el))){
+    if(!multi && selected && selected.isContentEditable && (el===selected || selected.contains(el))){
       if(inLink) e.preventDefault(); // block link navigation while editing
       return;
     }
     if(inLink) e.preventDefault();   // don't follow links when selecting
     e.stopPropagation();
-    select(el);
-    ensureCaret(e.clientX, e.clientY);
+    select(el, {multi});
+    if(!multi) ensureCaret(e.clientX, e.clientY);
   }
 
   // Place a visible caret where the user clicked (or keep their drag-selection).
@@ -383,25 +428,50 @@
     }catch(_){ try{ selected.focus({preventScroll:true}); }catch(__){} }
   }
 
-  function select(el){
+  function select(el, opts){
+    opts = opts || {};
     if(!el || el===doc.body || el===doc.documentElement) return;
-    deselect();
-    selected = el;
-    el.classList.remove('__ee-hover');
-    el.classList.add('__ee-selected');
-    if(!isMedia(el)){ el.setAttribute('contenteditable','true'); try{ el.focus({preventScroll:true}); }catch(_){} }
-    renderInspector(el);
-    renderBreadcrumb(el);
-  }
-  function deselect(){
-    if(selected){
-      selected.classList.remove('__ee-selected','__ee-hover');
-      selected.removeAttribute('contenteditable');
-      if(!selected.getAttribute('class')) selected.removeAttribute('class');
+    ensureElementIds(el.parentElement || doc.body);
+    if(opts.multi){
+      if(selectedSet.has(el)){
+        selectedSet.delete(el);
+        el.classList.remove('__ee-selected','__ee-hover');
+        el.removeAttribute('contenteditable');
+        if(!el.getAttribute('class')) el.removeAttribute('class');
+        selected = selectedNodes()[0] || null;
+      }else{
+        selectedSet.add(el);
+        selected = el;
+      }
+    }else{
+      deselect(true);
+      selectedSet = new Set([el]);
+      selected = el;
     }
+    applySelectionState();
+  }
+  function applySelectionState(){
+    if(!doc) return;
+    clearEditorSelection(doc);
+    const nodes = selectedNodes();
+    selectedSet = new Set(nodes);
+    nodes.forEach(el=>{ el.classList.remove('__ee-hover'); el.classList.add('__ee-selected'); });
+    if(selected && !nodes.includes(selected)) selected = nodes[0] || null;
+    if(selected && !isMedia(selected)){
+      selected.setAttribute('contenteditable','true');
+      try{ selected.focus({preventScroll:true}); }catch(_){}
+    }
+    if(nodes.length>1) renderMultiInspector(nodes);
+    else if(selected) renderInspector(selected);
+    else renderEmptyInspector();
+    renderBreadcrumb(selected);
+  }
+  function deselect(silent){
+    if(doc) clearEditorSelection(doc);
+    selectedSet.clear();
     selected = null;
-    renderEmptyInspector();
-    if(doc) renderBreadcrumb(null);
+    if(!silent) renderEmptyInspector();
+    if(doc && !silent) renderBreadcrumb(null);
   }
 
   /* ---------- inline text edit history ---------- */
@@ -418,6 +488,7 @@
     if(el && el.isContentEditable && el.getAttribute('data-ee-bind')){
       syncBoundText(el);
       if(el===selected){ const text = $('#f-text'); if(text) text.value = el.textContent; }
+      if(el===selected){ const mtext = $('#m-text'); if(mtext) mtext.value = el.textContent; }
     }
   }
 
@@ -441,10 +512,16 @@
       if(i>0){ const s=document.createElement('span'); s.className='sep'; s.textContent='›'; bar.appendChild(s); }
       const c = document.createElement('span');
       c.className = 'crumb' + (node===el?' cur':'');
-      c.textContent = node===doc.body ? 'body' : node.tagName.toLowerCase();
+      const eid = node.getAttribute && node.getAttribute('data-ee-id');
+      c.textContent = node===doc.body ? 'body' : node.tagName.toLowerCase()+(eid?' '+eid:'');
       c.onclick = ()=>{ if(node!==doc.body) select(node); };
       bar.appendChild(c);
     });
+    const count = selectedNodes().length;
+    if(count>1){
+      const s=document.createElement('span'); s.className='crumb cur'; s.textContent='已多选 '+count+' 个';
+      bar.appendChild(s);
+    }
   }
 
   /* ---------- inspector ---------- */
@@ -496,7 +573,7 @@
     targets.forEach(n=>n.setAttribute('data-ee-bind',key));
     syncBoundText(el);
     snapshot();
-    renderInspector(el);
+    applySelectionState();
     toast('已绑定 '+targets.length+' 处到 '+key);
   }
   function clearTextBinding(el){
@@ -504,16 +581,83 @@
     const key = el.getAttribute('data-ee-bind');
     el.removeAttribute('data-ee-bind');
     snapshot();
-    renderInspector(el);
+    applySelectionState();
     toast('已解除当前绑定（同组剩余 '+boundNodes(key).length+' 处）');
+  }
+  function setCondition(nodes, expr){
+    expr = (expr||'').trim();
+    nodes = (nodes||[]).filter(Boolean);
+    nodes.forEach(n=>{ expr ? n.setAttribute('data-ee-if',expr) : n.removeAttribute('data-ee-if'); });
+    snapshot();
+    applySelectionState();
+    toast(expr ? '已设置条件显示' : '已清除条件');
+  }
+  function evaluateCondition(expr,row,index){
+    expr = (expr||'').trim();
+    if(!expr) return true;
+    const data = Object.assign({}, row || {}, {index:index+1, index0:index});
+    try{ return !!Function('row','index','index0','with(row){ return !!('+expr+'); }')(data,index+1,index); }
+    catch(_){ return false; }
+  }
+  function stripEditorMetaFromClone(root){
+    root.querySelectorAll('[contenteditable]').forEach(n=>n.removeAttribute('contenteditable'));
+    root.querySelectorAll('[data-ee-id],[data-ee-bind],[data-ee-if]').forEach(n=>{
+      n.removeAttribute('data-ee-id'); n.removeAttribute('data-ee-bind'); n.removeAttribute('data-ee-if');
+    });
+    root.querySelectorAll('.__ee-hover,.__ee-selected').forEach(n=>{
+      n.classList.remove('__ee-hover','__ee-selected'); if(!n.getAttribute('class')) n.removeAttribute('class');
+    });
+  }
+  function applyConditionsToHTML(html,row,index){
+    const parsed = new DOMParser().parseFromString(html,'text/html');
+    parsed.querySelectorAll('[data-ee-if]').forEach(n=>{
+      evaluateCondition(n.getAttribute('data-ee-if'),row,index) ? n.removeAttribute('data-ee-if') : n.remove();
+    });
+    stripEditorMetaFromClone(parsed);
+    return '<!DOCTYPE html>\n'+parsed.documentElement.outerHTML;
+  }
+
+  function renderMultiInspector(nodes){
+    const textNodes = nodes.filter(isTextBindable);
+    const ids = nodes.map(n=>n.getAttribute('data-ee-id')||'?').join('、');
+    const sameText = textNodes.length && textNodes.every(n=>n.textContent===textNodes[0].textContent);
+    const bindKey = textNodes.length && textNodes.every(n=>n.getAttribute('data-ee-bind')===textNodes[0].getAttribute('data-ee-bind')) ? (textNodes[0].getAttribute('data-ee-bind')||'') : '';
+    const cond = nodes.length && nodes.every(n=>n.getAttribute('data-ee-if')===nodes[0].getAttribute('data-ee-if')) ? (nodes[0].getAttribute('data-ee-if')||'') : '';
+    inspector.innerHTML = `<div class="sec"><h4>多选</h4>
+      <span class="tag-pill">${nodes.length} 个元素</span>
+      <div class="hint">编号：${esc(ids)}</div></div>
+      <div class="sec"><h4>同时改文字</h4>
+        <div class="field"><textarea id="m-text" placeholder="${textNodes.length?'输入后同时写入选中的文本元素':'所选元素没有可直接改的纯文本'}" ${textNodes.length?'':'disabled'}>${sameText?esc(textNodes[0].textContent):''}</textarea></div>
+        <div class="hint">会作用到 ${textNodes.length} 个纯文本元素。</div></div>
+      <div class="sec"><h4>同步绑定</h4>
+        <div class="inline-action">
+          <input type="text" id="m-bind-name" value="${esc(bindKey)}" placeholder="event_time">
+          <button class="btn" id="m-bind-apply" type="button">绑定选中</button>
+        </div>
+        <button class="btn" id="m-bind-clear" type="button" style="width:100%;justify-content:center;margin-top:8px">解除选中绑定</button>
+      </div>
+      <div class="sec"><h4>条件显示</h4>
+        <div class="field"><input type="text" id="m-if" value="${esc(cond)}" placeholder='type == "vip"'></div>
+        <div class="op-grid">
+          <button class="btn" id="m-if-apply">应用条件</button>
+          <button class="btn" id="m-if-clear">清除条件</button>
+        </div>
+      </div>
+      <div class="sec"><h4>操作</h4>
+        <button class="btn" id="m-del" style="width:100%;justify-content:center;color:#ff9aa6;border-color:#5a2730">🗑 删除选中元素</button>
+      </div>`;
+    bindMulti(nodes);
   }
 
   function renderInspector(el){
     const tag = el.tagName.toLowerCase();
     const cs = frame.contentWindow.getComputedStyle(el);
+    const eid = el.getAttribute('data-ee-id') || '';
+    const cond = el.getAttribute('data-ee-if') || '';
     let h = '';
 
     h += `<div class="sec"><h4>已选中元素</h4><span class="tag-pill">&lt;${tag}&gt;</span>
+      ${eid?` <span class="tag-pill">${esc(eid)}</span>`:''}
       ${el.id?` <span class="tag-pill">#${esc(el.id)}</span>`:''}
       <div class="hint">直接在邮件中点选文字即可修改。下面是更多设置。</div></div>`;
 
@@ -537,6 +681,13 @@
         </div>
         <div class="hint">${bindKey ? `同组 ${bindCount} 处 · ${esc(bindKey)}` : '未绑定'}</div></div></div>`;
     }
+
+    h += `<div class="sec"><h4>条件显示</h4>
+      <div class="field"><label>批量生成时成立才保留</label><input type="text" id="f-if" value="${esc(cond)}" placeholder='type == "vip"'></div>
+      <div class="op-grid">
+        <button class="btn" id="f-if-apply">应用条件</button>
+        <button class="btn" id="f-if-clear">清除条件</button>
+      </div></div>`;
 
     // link
     if(tag==='a'){
@@ -588,6 +739,26 @@
     bind(el);
   }
 
+  function bindMulti(nodes){
+    const on = (id,ev,fn)=>{ const n=$('#'+id); if(n) n.addEventListener(ev,fn); };
+    on('m-text','input',e=>{
+      selectedTextNodes().forEach(n=>{ n.textContent = e.target.value; syncBoundText(n); });
+    });
+    on('m-text','change',snapshot);
+    on('m-bind-apply','click',()=>{
+      const textNodes = selectedTextNodes();
+      if(!textNodes.length){ toast('没有可绑定的文本元素'); return; }
+      applyTextBinding(textNodes[0], ($('#m-bind-name')||{}).value, textNodes);
+    });
+    on('m-bind-clear','click',()=>{
+      selectedTextNodes().forEach(n=>n.removeAttribute('data-ee-bind'));
+      snapshot(); applySelectionState(); toast('已解除选中绑定');
+    });
+    on('m-if-apply','click',()=>setCondition(selectedNodes(), ($('#m-if')||{}).value));
+    on('m-if-clear','click',()=>setCondition(selectedNodes(), ''));
+    on('m-del','click',deleteEl);
+  }
+
   function bind(el){
     const on = (id,ev,fn)=>{ const n=$('#'+id); if(n) n.addEventListener(ev,fn); };
 
@@ -615,6 +786,8 @@
       applyTextBinding(el, ($('#f-bind-name')||{}).value, matches);
     });
     on('f-bind-clear','click',()=>clearTextBinding(el));
+    on('f-if-apply','click',()=>setCondition([el], ($('#f-if')||{}).value));
+    on('f-if-clear','click',()=>setCondition([el], ''));
 
     on('f-href','input',e=>el.setAttribute('href',e.target.value));
     on('f-href','change',snapshot);
@@ -654,30 +827,40 @@
     }));
 
     on('op-del','click',deleteEl);
-    on('op-dup','click',()=>{ const c=el.cloneNode(true); c.classList.remove('__ee-selected','__ee-hover'); c.removeAttribute('contenteditable'); el.after(c); snapshot(); toast('已复制一份'); });
+    on('op-dup','click',()=>{
+      const c=el.cloneNode(true);
+      c.classList.remove('__ee-selected','__ee-hover');
+      c.removeAttribute('contenteditable');
+      c.querySelectorAll('[data-ee-id]').forEach(n=>n.removeAttribute('data-ee-id'));
+      c.removeAttribute('data-ee-id');
+      el.after(c); ensureElementIds(c); snapshot(); toast('已复制一份');
+    });
     on('op-up','click',()=>{ if(el.previousElementSibling){ el.parentNode.insertBefore(el,el.previousElementSibling); snapshot(); } });
     on('op-down','click',()=>{ if(el.nextElementSibling){ el.parentNode.insertBefore(el.nextElementSibling,el); snapshot(); } });
     on('op-parent','click',()=>{ if(el.parentElement && el.parentElement!==doc.body) select(el.parentElement); });
   }
 
   function deleteEl(){
-    if(!selected) return;
-    const p = selected.parentNode; if(!p) return;
-    p.removeChild(selected); selected=null; deselect(); snapshot(); toast('已删除');
+    const nodes = selectedNodes();
+    if(!nodes.length) return;
+    nodes.forEach(n=>{ if(n.parentNode) n.parentNode.removeChild(n); });
+    deselect(); snapshot(); toast(nodes.length>1?'已删除选中元素':'已删除');
   }
 
   /* ---------- export ---------- */
-  function getCleanHTML(){
+  function getEditorHTML(keepMeta){
     if(!doc) return '';
     const clone = doc.documentElement.cloneNode(true);
     const s = clone.querySelector('#__ee_style'); if(s) s.remove();
     clone.querySelectorAll('[contenteditable]').forEach(n=>n.removeAttribute('contenteditable'));
-    clone.querySelectorAll('[data-ee-bind]').forEach(n=>n.removeAttribute('data-ee-bind'));
     clone.querySelectorAll('.__ee-hover,.__ee-selected').forEach(n=>{
       n.classList.remove('__ee-hover','__ee-selected'); if(!n.getAttribute('class')) n.removeAttribute('class');
     });
+    if(!keepMeta) stripEditorMetaFromClone(clone);
     return '<!DOCTYPE html>\n'+clone.outerHTML;
   }
+  function getCleanHTML(){ return getEditorHTML(false); }
+  function getBatchTemplateHTML(){ return getEditorHTML(true); }
   function downloadText(filename,text,type){
     const blob = new Blob([text], {type:type||'text/plain'});
     const a = document.createElement('a');
@@ -705,7 +888,7 @@
       return rawKey || !escapeHTML ? String(value==null?'':value) : htmlEscapeValue(value);
     });
   }
-  function applyBatchTemplate(template,row,index){ return replaceTemplateTokens(template,row,index,true); }
+  function applyBatchTemplate(template,row,index){ return replaceTemplateTokens(applyConditionsToHTML(template,row,index),row,index,true); }
   function applyPlainTemplate(template,row,index){ return replaceTemplateTokens(template,row,index,false); }
   function collectPlaceholders(template){
     const names = new Set();
@@ -799,7 +982,7 @@
     const varsBox = $('#batchVars'), summary = $('#batchSummary'), preview = $('#batchPreview');
     const download = $('#batchDownload'), previewBtn = $('#batchPreviewBtn');
     if(!varsBox || !summary || !preview) return;
-    const template = doc ? getCleanHTML() : '';
+    const template = doc ? getBatchTemplateHTML() : '';
     const vars = collectPlaceholders(template);
     varsBox.innerHTML = vars.length ? vars.map(v=>'<code>{{'+esc(v)+'}}</code>').join('') : '<span class="hint">当前模板暂无变量</span>';
     let rows = [], error = '';
@@ -824,7 +1007,7 @@
     try{ rows = parseBatchInput($('#batchData').value); }catch(err){ toast('数据解析失败：'+err.message); return; }
     if(!rows.length){ toast('请先填写批量数据'); return; }
     if(rows.length>50 && !confirm('将下载 '+rows.length+' 个 HTML 文件，继续吗？')) return;
-    const template = getCleanHTML();
+    const template = getBatchTemplateHTML();
     const nameTpl = $('#batchName').value || 'email-{{index}}.html';
     const used = new Set();
     rows.forEach((row,i)=>{
